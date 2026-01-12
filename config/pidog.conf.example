@@ -1,0 +1,11 @@
+# robot-hat config and calibration value of robots
+
+# Init angles (must exist and be parseable)
+leg_init_angles = [0,0,0,0,0,0,0,0]
+head_init_angles = [0,0,0]
+tail_init_angles = [0]
+
+# Servo offsets
+legs_servo_offset_list = [0.0,10.109890109890113,0.0,0.0,0.0,6.704395604395603,0.0,-3.5164835164835173]
+head_servo_offset_list = [-0.8791208791208793,-0.4395604395604397,0.186813186813191]
+tail_servo_offset_list = [0.0]
