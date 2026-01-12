@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pidog_inneo.py
 import os
 import sys
 import threading
@@ -50,9 +51,12 @@ def load_module_from_path(name: str, path: str):
 
 
 def stdin_reader():
+    """
+    Kein Prompt, damit Walk-Statuszeile nicht ständig den Prompt "zerstört".
+    """
     while not stop_event.is_set():
         try:
-            s = input("> ").strip()
+            s = input().strip()
         except (EOFError, KeyboardInterrupt):
             stop_event.set()
             break
@@ -131,7 +135,8 @@ def main():
         "  paw       - give paw\n"
         "  walk      - start walking\n"
         "  stop      - stop walking\n"
-        "  quit      - exit program",
+        "  quit      - exit program\n"
+        "\nTippe einfach den Command und drücke Enter.",
         flush=True
     )
 
@@ -169,6 +174,7 @@ def main():
         print("[OK] walk started (type 'stop' to stop)", flush=True)
 
     def stop_walk():
+        # Stop-Event setzen + sofort Hardware stoppen
         walk_stop.set()
         try:
             dog.body_stop()
@@ -206,7 +212,7 @@ def main():
                 pose_state = "stand"
                 continue
 
-            if cmd in ("lie", "hinlegen"):
+            if cmd in ("lie", "hinlegen", "lie down"):
                 stop_walk()
                 try:
                     safe_lie_down(dog)
@@ -225,7 +231,6 @@ def main():
             if cmd == "paw":
                 stop_walk()
                 try:
-                    # Paw-Skript macht seinen sit jetzt auch langsam (in angewinkelt.py)
                     call_best_entry(paw_mod, dog)
                     print("[OK] paw done", flush=True)
                     pose_state = "sit"

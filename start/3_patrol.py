@@ -1,79 +1,84 @@
 #!/usr/bin/env python3
+# 3_patrol.py
 import time
-from pidog.preset_actions import bark
+
+# Bark ist optional (Sound braucht oft sudo)
+try:
+    from pidog.preset_actions import bark as _bark
+except Exception:
+    _bark = None
 
 # ---------------- Tuning ----------------
-DANGER_DISTANCE = 15
+DANGER_DISTANCE = 18        # etwas höher = bremst früher
+FORWARD_SPEED   = 98        # deutlich schneller
+FORWARD_STEPS   = 2         # weniger Drift als 4+, trotzdem schnell
+TICK_SEC        = 0.05      # öfter nachschieben = flüssiger
 
-# Wie schnell/kräftig laufen soll (je nach Firmware fühlt sich 40–70 gut an)
-WALK_SPEED = 55
+# Status-Ausgabe drosseln (gegen Spam)
+STATUS_MIN_INTERVAL = 0.25
+STATUS_MIN_DELTA    = 1.0
 
-# Tick-Mode: wie oft wir Bewegung "nachkicken" (kleiner = flüssiger, aber mehr CPU)
-WALK_TICK_SEC = 0.08
-
-# Wenn dein Dog sonst zu hektisch ist: 0.10–0.15
-# Wenn er träge ist: 0.05–0.08
+# Sound/Bark aktiv?
+ENABLE_BARK = False  # True nur, wenn du via sudo startest
 # ----------------------------------------
 
 
-def _call_do_action(dog, name, speed):
+def _do_action(dog, name, *, speed=50, step_count=1) -> bool:
     try:
-        dog.do_action(name, speed=speed)
+        dog.do_action(name, step_count=step_count, speed=speed)
         return True
     except Exception:
         return False
 
 
-def _try_start_continuous_walk(dog, speed):
+def read_distance_best_effort(dog) -> float:
     """
-    Ziel: Eine Walk-Action starten, die selbständig weiterläuft,
-    bis body_stop() oder eine andere Action kommt.
-
-    Falls eure Firmware das nicht unterstützt, gibt es False zurück.
+    Versucht mehrere bekannte APIs (je nach PiDog Library/Firmware).
+    Gibt -1.0 zurück, wenn nichts Valides kommt.
     """
-    # Häufige Namen in Beispielen/Builds
-    for action in ("walk", "forward", "walk_forward", "go"):
-        if _call_do_action(dog, action, speed):
-            return True
-    return False
-
-
-def _try_walk_tick(dog, speed):
-    """
-    Tick-basierter Walk (für Firmwares ohne continuous walk).
-    Probiert mehrere APIs.
-    """
-    # 1) Action-Impulse
-    for action in ("forward", "walk_forward", "walk", "go"):
-        if _call_do_action(dog, action, speed):
-            return True
-
-    # 2) Direkte Methoden
-    for method_name in ("forward", "walk", "move_forward", "go_forward", "body_forward"):
-        fn = getattr(dog, method_name, None)
-        if callable(fn):
-            try:
-                fn(speed)
-                return True
-            except Exception:
-                pass
-
-    # 3) body_move(vx, vy, yaw) falls vorhanden
-    fn = getattr(dog, "body_move", None)
+    # 1) manche Builds haben dog.read_distance()
+    fn = getattr(dog, "read_distance", None)
     if callable(fn):
         try:
-            # etwas stärker nach vorne als vorher
-            fn(35, 0, 0)
-            return True
+            d = float(fn())
+            if d > 0:
+                return d
         except Exception:
             pass
 
-    return False
+    # 2) andere haben dog.ultrasonic.*
+    us = getattr(dog, "ultrasonic", None)
+    if us is not None:
+        for name in ("read_distance", "read_distance_value", "read_distance_cm", "get_distance"):
+            f = getattr(us, name, None)
+            if callable(f):
+                try:
+                    d = float(f())
+                    if d > 0:
+                        return d
+                except Exception:
+                    pass
+
+    return -1.0
 
 
 def run(dog, stop_evt=None):
     def should_stop() -> bool:
         return (stop_evt is not None) and stop_evt.is_set()
+
+    def hard_stop():
+        # Sofort alles anhalten (räumt Action-Queues)
+        try:
+            dog.body_stop()
+        except Exception:
+            pass
+
+    def status_line(text: str):
+        txt = (text[:120]).ljust(120)
+        print("\r" + txt, end="", flush=True)
+
+    def status_newline(text: str):
+        print("\r" + text + " " * 10, flush=True)
 
     # Startpose
     try:
@@ -83,99 +88,131 @@ def run(dog, stop_evt=None):
     except Exception:
         pass
 
-    stand = dog.legs_angle_calculation([[0, 80], [0, 80], [30, 75], [30, 75]])
+    # Stand-Pose (wie vorher)
+    try:
+        stand = dog.legs_angle_calculation([[0, 80], [0, 80], [30, 75], [30, 75]])
+    except Exception:
+        stand = None
 
-    walking_mode = "none"   # "continuous" | "tick" | "none"
-    last_kick = 0.0
+    last_tick = 0.0
+    last_status_ts = 0.0
+    last_dist = None
 
     while True:
+        # Stop immer priorisieren
         if should_stop():
+            hard_stop()
             break
 
-        distance = round(dog.read_distance(), 2)
-        print(f"distance: {distance} cm", end="", flush=True)
+        # Distanz best-effort lesen
+        distance = round(read_distance_best_effort(dog), 2)
+        now = time.time()
+
+        # Status throttling
+        dist_changed = (
+            last_dist is None or
+            (distance > 0 and last_dist is not None and abs(distance - last_dist) >= STATUS_MIN_DELTA)
+        )
+        if (now - last_status_ts) >= STATUS_MIN_INTERVAL or dist_changed:
+            status_line(f"[WALK] distance: {distance:.2f} cm")
+            last_status_ts = now
+            last_dist = distance
+
+        # Wenn Distanz ungültig: NICHT blind weiterlaufen -> sofort stoppen
+        if distance <= 0:
+            hard_stop()
+            status_line("[WALK] distance invalid -> STOP (check ultrasonic / API)")
+            time.sleep(0.10)
+            continue
 
         # ---------------- DANGER ----------------
-        if distance > 0 and distance < DANGER_DISTANCE:
-            print("\033[0;31m DANGER !\033[m")
+        if distance < DANGER_DISTANCE:
+            status_newline(f"[WALK] distance: {distance:.2f} cm  DANGER!")
+            hard_stop()
 
-            # Stop immediately
-            try:
-                dog.body_stop()
-            except Exception:
-                pass
+            if should_stop():
+                break
 
-            walking_mode = "none"
-            last_kick = 0.0
-
-            head_yaw = dog.head_current_angles[0]
-
+            # LED/pose
             try:
                 dog.rgb_strip.set_mode("bark", "red", bps=2)
             except Exception:
                 pass
 
-            try:
-                dog.tail_move([[0]], speed=80)
-                dog.legs_move([stand], speed=70)
-                dog.wait_all_done()
-            except Exception:
-                pass
+            if stand is not None and not should_stop():
+                try:
+                    dog.tail_move([[0]], speed=80)
+                    dog.legs_move([stand], speed=70)
+                    dog.wait_all_done()
+                except Exception:
+                    pass
 
-            time.sleep(0.25)
+            if should_stop():
+                hard_stop()
+                break
 
-            try:
-                bark(dog, [head_yaw, 0, 0])
-            except Exception:
-                pass
+            # Bark optional
+            if ENABLE_BARK and _bark is not None and not should_stop():
+                try:
+                    head_yaw = dog.head_current_angles[0]
+                except Exception:
+                    head_yaw = 0
+                try:
+                    _bark(dog, [head_yaw, 0, 0])
+                except Exception:
+                    pass
 
-            # Wait until safe (or stop)
+            # Warten bis wieder safe (abbrechbar)
             while True:
                 if should_stop():
+                    hard_stop()
                     break
 
-                distance = round(dog.read_distance(), 2)
-                if distance > 0 and distance < DANGER_DISTANCE:
-                    print(f"distance: {distance} cm \033[0;31m DANGER !\033[m")
+                distance = round(read_distance_best_effort(dog), 2)
+                if distance <= 0:
+                    hard_stop()
+                    status_line("[WALK] distance invalid -> STOP (waiting)")
+                    time.sleep(0.10)
+                    continue
+
+                if distance < DANGER_DISTANCE:
+                    status_line(f"[WALK] distance: {distance:.2f} cm  DANGER! (waiting)")
+                    time.sleep(0.05)
                 else:
-                    print(f"distance: {distance} cm", end="", flush=True)
+                    status_newline(f"[WALK] safe again (distance: {distance:.2f} cm)")
                     break
-                time.sleep(0.02)
-
-            print("", flush=True)
 
         # ---------------- SAFE ----------------
         else:
-            print("", flush=True)
+            if should_stop():
+                hard_stop()
+                break
 
-            now = time.time()
+            # optional LED
+            try:
+                dog.rgb_strip.set_mode("breath", "white", bps=0.5)
+            except Exception:
+                pass
 
-            # Wenn wir noch nicht laufen: erst versuchen "continuous"
-            if walking_mode == "none":
-                ok = _try_start_continuous_walk(dog, WALK_SPEED)
-                if ok:
-                    walking_mode = "continuous"
-                    # Bei continuous müssen wir nichts mehr tickern
-                else:
-                    walking_mode = "tick"
-                    last_kick = 0.0  # sofort los-tickern
+            # laufen in Ticks
+            if now - last_tick >= TICK_SEC:
+                if should_stop():
+                    hard_stop()
+                    break
 
-            # Tick-Mode: regelmäßig nachkicken -> flüssiger
-            if walking_mode == "tick":
-                if now - last_kick >= WALK_TICK_SEC:
-                    ok = _try_walk_tick(dog, WALK_SPEED)
-                    if not ok:
-                        # wenn gar nichts passt, abbrechen
-                        print("[WARN] Walk API nicht gefunden. Passe _try_walk_tick an.", flush=True)
-                        walking_mode = "none"
-                        # nicht spammen
-                        time.sleep(0.5)
-                    last_kick = now
+                ok = _do_action(dog, "forward", speed=FORWARD_SPEED, step_count=FORWARD_STEPS)
+                if not ok:
+                    status_newline("[ERROR] Preset action 'forward' nicht verfügbar. Prüfe PiDog Library/Version.")
+                    time.sleep(0.5)
+
+                # falls stop in der Zwischenzeit kam
+                if should_stop():
+                    hard_stop()
+                    break
+
+                last_tick = now
 
         time.sleep(0.01)
 
-    # Shutdown
-    try:
-        dog.body_stop()
-    except Exception:
-        pass
+    status_newline("[WALK] stopping...")
+    hard_stop()
