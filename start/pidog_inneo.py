@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # start/pidog_inneo.py
+from __future__ import annotations
+
 import os
 import sys
 import threading
@@ -7,8 +9,54 @@ import queue
 import importlib.util
 import traceback
 import time
+from pathlib import Path
 
-from pidog import Pidog
+# -------------------------------------------------
+# Find project root that contains "brain/" and add to sys.path
+# This makes "from brain..." work regardless of cwd.
+# Your layout:
+#   ~/pidog/brain/...
+#   ~/pidog/pidog-inneo/start/pidog_inneo.py
+# -------------------------------------------------
+def _find_root_with_brain(start: Path) -> Path:
+    cur = start
+    for _ in range(8):
+        if (cur / "brain").is_dir():
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    # Fallback: one level up
+    return start.parent
+
+PROJECT_ROOT = _find_root_with_brain(Path(__file__).resolve().parent)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from brain.ai_brain import think
+from brain.actions import apply_intent
+
+# -------------------------------------------------
+# Try real PiDog library; if missing (Pi-only / venv), use simulation stub
+# -------------------------------------------------
+SIMULATION = False
+try:
+    from pidog import Pidog  # type: ignore
+except Exception:
+    SIMULATION = True
+
+    class Pidog:  # minimal stub for simulation
+        def __init__(self):
+            self.head = None
+            self.tail = None
+            self._head_suppress = None
+
+        def body_stop(self):
+            pass
+
+        def close(self):
+            pass
+
 
 # ----------------- CONFIG -----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +68,9 @@ PATH_TOUCH  = os.path.join(BASE_DIR, "touch_wag.py")
 
 PATH_SIT    = os.path.join(BASE_DIR, "sitzen.py")
 PATH_STAND  = os.path.join(BASE_DIR, "stehen.py")
+
+# NEW: Gabi face attention module
+PATH_GABI   = os.path.join(BASE_DIR, "gabi_face.py")
 
 # Head anti-jitter (global)
 HEAD_DEADBAND = 4
@@ -164,12 +215,50 @@ def _patch_head_servo_move(dog: Pidog):
     print("[INFO] Head anti-jitter patch enabled (coalesce + deadband + suppression)", flush=True)
 
 
+def _run_simulation_mode():
+    print("[WARN] pidog module not found -> SIMULATION MODE (Pi-only).", flush=True)
+    print(
+        "Commands (simulation):\n"
+        "  pet   - AI intent test (no movement)\n"
+        "  quit  - exit\n",
+        flush=True
+    )
+
+    threading.Thread(target=stdin_reader, daemon=True).start()
+
+    while not stop_event.is_set():
+        try:
+            raw = cmd_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        cmd = raw.strip().lower()
+        if cmd in ("quit", "exit", "q"):
+            break
+
+        if cmd == "pet":
+            intent = think("The dog is being gently petted.")
+            print(f"[AI TEST] intent = {intent}", flush=True)
+            print("[AI TEST] (no movement – simulation)", flush=True)
+            continue
+
+        print("[ERR] Unknown command (simulation). Use: pet, quit", flush=True)
+
+    print("[INFO] Bye (simulation).", flush=True)
+
+
 def main():
     print("[INFO] pidog_inneo.py starting...", flush=True)
     print(f"[INFO] Python: {sys.version}", flush=True)
     print(f"[INFO] BASE_DIR: {BASE_DIR}", flush=True)
+    print(f"[INFO] PROJECT_ROOT(for brain): {PROJECT_ROOT}", flush=True)
 
-    for p in (PATH_PATROL, PATH_PAW, PATH_LIE, PATH_TOUCH, PATH_SIT, PATH_STAND):
+    if SIMULATION:
+        _run_simulation_mode()
+        return
+
+    # Real hardware mode: ensure required files exist
+    for p in (PATH_PATROL, PATH_PAW, PATH_LIE, PATH_TOUCH, PATH_SIT, PATH_STAND, PATH_GABI):
         if not os.path.exists(p):
             raise FileNotFoundError(f"Missing file: {p}")
 
@@ -182,6 +271,8 @@ def main():
         "  paw       - give paw\n"
         "  walk      - start walking\n"
         "  stop      - stop walking\n"
+        "  gabi      - face search + look + tail wag (10s)\n"
+        "  pet       - AI intent test (no movement)\n"
         "  quit      - exit program\n"
         "\nTippe einfach den Command und drücke Enter.",
         flush=True
@@ -202,6 +293,7 @@ def main():
     touch_mod  = load_module_from_path("touch_mod", PATH_TOUCH)
     sit_mod    = load_module_from_path("sit_mod", PATH_SIT)
     stand_mod  = load_module_from_path("stand_mod", PATH_STAND)
+    gabi_mod   = load_module_from_path("gabi_mod", PATH_GABI)
 
     # touch watcher background
     threading.Thread(target=call_best_entry, args=(touch_mod, dog, stop_event), daemon=True).start()
@@ -320,6 +412,35 @@ def main():
                 stop_walk()
                 print("[OK] stopped", flush=True)
                 continue
+
+            if cmd == "gabi":
+                stop_walk()
+                try:
+                    call_best_entry(gabi_mod, dog, stop_event)
+                    print("[OK] gabi done", flush=True)
+                except Exception as e:
+                    print(f"[ERROR] gabi failed: {e}", flush=True)
+                    traceback.print_exc()
+                continue
+            
+            if cmd == "pet":
+                stop_walk()
+                try:
+                    intent = think("The dog is being gently petted.")
+                    print(f"[AI] intent = {intent}", flush=True)
+
+                    apply_intent(
+                        intent,
+                        head=getattr(dog, "head", None),
+                        tail=getattr(dog, "tail", None),
+                    )
+
+                except Exception as e:
+                    print(f"[ERROR] pet failed: {e}", flush=True)
+                    traceback.print_exc()
+                continue
+
+
 
             print("[ERR] Unknown command. Type a command from the list above.", flush=True)
 
